@@ -225,14 +225,31 @@ def vision_attention_flash(q, k, v, q_cu_seqlens, k_cu_seqlens, max_seqlen_q=Non
 
 
 def vision_attention_sdpa(q, k, v, q_cu_seqlens, k_cu_seqlens, **kwargs):
-    """SDPA attention for vision."""
-    seq_length = q.shape[0]
-    attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
-    for i in range(1, len(q_cu_seqlens)):
-        attention_mask[..., q_cu_seqlens[i - 1] : q_cu_seqlens[i], q_cu_seqlens[i - 1] : q_cu_seqlens[i]] = True
-    q, k, v = q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1)
-    attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
-    return attn_output.transpose(0, 1).reshape(seq_length, -1)
+    """SDPA attention for vision.
+
+    ``q``, ``k`` and ``v`` are packed ``(total_len, num_heads, head_dim)`` and every image (or video) in
+    ``q_cu_seqlens`` attends only to itself. Attention runs per sequence, batched when all sequences have the
+    same length, so no ``(total_len, total_len)`` block-diagonal mask is built: with a mask, SDPA can't use the
+    flash kernel, the mask is O(total_len^2), and PyTorch < 2.14 falls back to the math kernel for 3-D inputs
+    with a mask, which materialises the full attention matrix for every head in forward and backward.
+    """
+    total_len, num_heads, head_dim = q.shape
+    seqlens = (q_cu_seqlens[1:] - q_cu_seqlens[:-1]).tolist()
+    if len(set(seqlens)) == 1:
+        q, k, v = (x.reshape(len(seqlens), seqlens[0], num_heads, head_dim).transpose(1, 2) for x in (q, k, v))
+        attn_output = F.scaled_dot_product_attention(q, k, v, dropout_p=0.0).transpose(1, 2)
+    else:
+        attn_output = torch.cat(
+            [
+                F.scaled_dot_product_attention(
+                    qi.transpose(0, 1).unsqueeze(0), ki.transpose(0, 1).unsqueeze(0), vi.transpose(0, 1).unsqueeze(0)
+                )
+                .squeeze(0)
+                .transpose(0, 1)
+                for qi, ki, vi in zip(q.split(seqlens), k.split(seqlens), v.split(seqlens))
+            ]
+        )
+    return attn_output.reshape(total_len, -1)
 
 
 class Learnable2DInterpPosEmbDividedFixed(nn.Module):

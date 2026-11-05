@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+import torch.nn.functional as F
 from transformers.models.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 
 from nemo_automodel.components.models.kimivl.model import (
@@ -832,6 +833,40 @@ class TestVisionAttentionFunctions:
         # Just verify it runs without error and produces correct shape
         output = vision_attention_sdpa(q, k, v, cu_seqlens, cu_seqlens)
         assert output.shape == (total, num_heads * head_dim)
+
+    @pytest.mark.parametrize("lengths", [[6, 6, 6], [5, 9, 3]])
+    def test_vision_attention_sdpa_matches_per_sequence_attention(self, lengths):
+        """Each packed sequence attends only to itself, for equal and unequal lengths."""
+        from nemo_automodel.components.models.kimivl.model import vision_attention_sdpa
+
+        num_heads, head_dim = 4, 8
+        total = sum(lengths)
+        q, k, v = (torch.randn(total, num_heads, head_dim) for _ in range(3))
+        cu_seqlens = torch.tensor([0] + torch.tensor(lengths).cumsum(0).tolist(), dtype=torch.int32)
+
+        output = vision_attention_sdpa(q, k, v, cu_seqlens, cu_seqlens)
+
+        expected = []
+        for qi, ki, vi in zip(q.split(lengths), k.split(lengths), v.split(lengths)):
+            qi, ki, vi = qi.transpose(0, 1), ki.transpose(0, 1), vi.transpose(0, 1)
+            weights = torch.softmax(qi @ ki.transpose(-2, -1) / head_dim**0.5, dim=-1)
+            expected.append((weights @ vi).transpose(0, 1).reshape(qi.shape[1], -1))
+        torch.testing.assert_close(output, torch.cat(expected))
+
+    def test_vision_attention_sdpa_builds_no_dense_mask(self):
+        """SDPA is called without an attention mask, so it is free to pick the flash kernel."""
+        from nemo_automodel.components.models.kimivl.model import vision_attention_sdpa
+
+        q, k, v = (torch.randn(10, 2, 8) for _ in range(3))
+        cu_seqlens = torch.tensor([0, 4, 10], dtype=torch.int32)
+
+        with patch.object(F, "scaled_dot_product_attention", wraps=F.scaled_dot_product_attention) as sdpa:
+            vision_attention_sdpa(q, k, v, cu_seqlens, cu_seqlens)
+
+        assert sdpa.call_count == 2
+        for call in sdpa.call_args_list:
+            assert len(call.args) == 3
+            assert call.kwargs.get("attn_mask") is None
 
 
 class TestMoonVitEncoderLayer:
